@@ -3,13 +3,13 @@
  * Supports placeholder interpolation with HTML content.
  */
 
-// type StrMap = Record<string, string>;
-type StrMap = Record<keyof typeof en, string>;
+import { getLanguage } from "obsidian";
 
 /* ------------------------------------------------------------------ */
-/*  English                                                            */
+/*  Key contract — en is the source of truth.                          */
 /* ------------------------------------------------------------------ */
-const en: Record<string, string> = {
+
+const en = {
   /* --- headings --- */
   "heading.title": "Local REST API with MCP",
   "heading.rest": "How to access via REST",
@@ -24,23 +24,32 @@ const en: Record<string, string> = {
   "rest.secureNote":
     "Requires that {link} be configured as a trusted certificate authority for your browser. See {wikiLink} for more information.",
   "rest.insecureName": "Non-encrypted (HTTP) API URL",
+  "rest.endpointUrl": "API URL",
   "rest.authHeader":
     "Your API key should be passed as a bearer token via the <code>{header}</code> header:",
+  "rest.authLabel": "authorization header value",
+  "rest.apiKeyHint": "Some tools ask for the API key on its own instead:",
   "rest.seeMore":
-    "Comprehensive documentation of what API endpoints are available can be found in {docsLink}.",
+    "Comprehensive documentation of what API endpoints are available can be found in {docsLink}",
 
   /* --- MCP section --- */
-  "mcp.intro": "You can connect to the MCP server via the following endpoints:",
+  "mcp.intro":
+    "You can connect to the MCP server via the following endpoints:",
   "mcp.secureName": "Encrypted (HTTPS) MCP Endpoint",
   "mcp.secureNote":
     "Requires that {link} be configured as a trusted certificate authority. See {wikiLink} for more information.",
   "mcp.insecureName": "Non-encrypted (HTTP) MCP endpoint",
+  "mcp.endpointUrl": "MCP endpoint URL",
+  "mcp.disabledHint":
+    "You can enable this from the plugin's settings page.",
   "mcp.authHeader":
     "Your API key should be passed as a bearer token via the <code>{header}</code> header:",
+  "mcp.authLabel": "authorization header value",
+  "mcp.apiKeyHint": "Some tools ask for the API key on its own instead:",
   "mcp.example":
     "Example Claude code MCP configuration (for .Claude/settings.json):",
   "mcp.seeMore":
-    "Configuration examples for other MCP clients can be found in {docsLink}.",
+    "Configuration examples for other MCP clients can be found in {docsLink}",
 
   /* --- common link labels --- */
   "link.certificate": "this certificate",
@@ -48,15 +57,21 @@ const en: Record<string, string> = {
   "link.docs": "the online docs",
   "link.readme": "the project readme",
 
+  /* --- copy feedback --- */
+  "copy.tooltip": "Copy {label}",
+  "copy.success": "Copied {label} to clipboard.",
+  "copy.failure": "Could not copy {label} to the clipboard.",
+
   /* --- status --- */
-  "status.disabled": "Disabled. You can enable this in 'Settings' below.",
+  "status.disabled": "Disabled. {hint}",
   "status.enabled": "Enabled",
 
   /* --- certificate warnings --- */
   "status.expired": "Your certificate has expired!",
   "status.expiredDesc":
     ' You must re-generate your certificate below by pressing the "Re-generate Certificates" button below in order to connect securely to this API.',
-  "status.expiringSoon": "Your certificate will expire in {days} day{suffix}!",
+  "status.expiringSoon":
+    "Your certificate will expire in {days} day{suffix}!",
   "status.expiringDesc":
     ' You should re-generate your certificate below by pressing the "Re-generate Certificates" button below in order to continue to connect securely to this API.',
   "status.regenerate": "You should re-generate your certificate!",
@@ -103,16 +118,79 @@ const en: Record<string, string> = {
   "setting.verboseLoggingDesc":
     "When enabled, logs server startup messages and a one-line access log entry for every request to the browser console.",
 
+  /* --- REST section additions (keys not in the REST section above) --- */
+  "rest.serverStatus": "Server status",
+  "rest.secureServerName": "Encrypted (HTTPS) server",
+  "rest.insecureServerName": "Non-encrypted (HTTP) server",
+  "rest.serverUrlCopyLabel": "server URL",
+  "rest.disabledHint": "You can enable this in the settings below.",
+  "rest.apiKeyDesc":
+    'Passed as a bearer token via the {header} header; see the "How to access" pages below for details.',
+  "rest.howToAccessDesc":
+    "Connection URLs, authentication, and API documentation.",
+
+  /* --- MCP section additions (keys not in the MCP section above) --- */
+  "mcp.howToAccessDesc":
+    "MCP endpoints, authentication, and client configuration examples.",
+
+  /* --- certificate display & update --- */
+  "cert.status": "Certificate status",
+  "cert.expired": "Expired",
+  "cert.expiresIn": "Expires in {days} day{suffix}",
+  "cert.shouldRegenerate": "Should be regenerated",
+  "cert.updateAvailable": "Update available",
+  "cert.valid": "Valid",
+  "cert.caUpdate":
+    'Certificate generation has been updated to support the stricter verification performed by recent versions of some browsers and tools (Firefox, for example). Your current certificate will keep working everywhere it works today. If you find that a browser or tool rejects it, press "Re-generate certificates" below, then re-import the newly generated certificate wherever you had trusted the old one.',
+
+  /* --- settings page sections --- */
+  "setting.certificates": "Certificates",
+  "setting.certificatesDesc":
+    "Regenerate certificates and edit certificate hostnames, key material, and the API key.",
+
+  /* --- modal dialogs --- */
+  "modal.resetTitle": "Reset all cryptography?",
+  "modal.resetMessage":
+    "This regenerates your certificate, private key, public key, and API key, and closes this settings panel. This cannot be undone.",
+  "modal.restoreTitle": "Restore default settings?",
+  "modal.restoreMessage":
+    "This resets this plugin\u2019s settings to defaults and closes this settings panel. This cannot be undone.",
+
+  /* --- advanced page --- */
+  "advanced.license": "License",
+  "advanced.caCert": "CA certificate",
+  "advanced.caCertDesc":
+    "The certificate authority that signed the server certificate; this is what clients download and trust. Leave empty if your server certificate is self-signed.",
+  "advanced.caPrivateKey": "CA private key",
+  "advanced.caPrivateKeyDesc":
+    "Used to renew the server certificate automatically before it expires. Leave empty to disable automatic renewal.",
+  "advanced.serverCert": "Server certificate",
+  "advanced.serverCertDesc":
+    "The certificate presented by the HTTPS server.",
+  "advanced.serverPublicKey": "Server public key",
+  "advanced.serverPrivateKey": "Server private key",
+
   /* --- advanced static text --- */
   "advanced.warning":
     "The settings below are potentially dangerous and are intended for use only by people who know what they are doing. Do not change any of these settings if you do not understand what that setting is used for and what security impacts changing that setting will have.",
   "advanced.noWarranty":
     "Use of this software is licensed to you under the MIT license, and it is important that you understand that this license provides you with no warranty. For the complete license text please see {licenseLink}.",
-};
+} as const;
+
+/* ------------------------------------------------------------------ */
+/*  Compile-time key parity                                            */
+/* ------------------------------------------------------------------ */
+
+/** Every valid translation key — derived from the English dictionary. */
+export type MessageKey = keyof typeof en;
+
+/** A translation map must have exactly the same keys as English. */
+type StrMap = Record<MessageKey, string>;
 
 /* ------------------------------------------------------------------ */
 /*  Chinese (Simplified)                                               */
 /* ------------------------------------------------------------------ */
+
 const zh: StrMap = {
   /* --- headings --- */
   "heading.title": "本地 REST API（含 MCP）",
@@ -128,9 +206,13 @@ const zh: StrMap = {
   "rest.secureNote":
     "需要将 {link} 配置为受浏览器信任的证书颁发机构。请参阅 {wikiLink} 了解更多信息。",
   "rest.insecureName": "非加密（HTTP）API 地址",
+  "rest.endpointUrl": "API 地址",
   "rest.authHeader":
     "您的 API 密钥应通过 <code>{header}</code> 标头以 Bearer 令牌形式传递：",
-  "rest.seeMore": "有关可用 API 端点的完整文档，请参阅 {docsLink}。",
+  "rest.authLabel": "授权标头值",
+  "rest.apiKeyHint": "某些工具需要单独的 API 密钥：",
+  "rest.seeMore":
+    "有关可用 API 端点的完整文档，请参阅 {docsLink}",
 
   /* --- MCP section --- */
   "mcp.intro": "您可以通过以下端点连接到 MCP 服务器：",
@@ -138,10 +220,15 @@ const zh: StrMap = {
   "mcp.secureNote":
     "需要将 {link} 配置为受信任的证书颁发机构。请参阅 {wikiLink} 了解更多信息。",
   "mcp.insecureName": "非加密（HTTP）MCP 端点",
+  "mcp.endpointUrl": "MCP 端点地址",
+  "mcp.disabledHint": "您可以在插件设置页面中启用此项。",
   "mcp.authHeader":
     "您的 API 密钥应通过 <code>{header}</code> 标头以 Bearer 令牌形式传递：",
+  "mcp.authLabel": "授权标头值",
+  "mcp.apiKeyHint": "某些工具需要单独的 API 密钥：",
   "mcp.example": "Claude Code MCP 配置示例（用于 .Claude/settings.json）：",
-  "mcp.seeMore": "其他 MCP 客户端的配置示例，请参阅 {docsLink}。",
+  "mcp.seeMore":
+    "其他 MCP 客户端的配置示例，请参阅 {docsLink}",
 
   /* --- common link labels --- */
   "link.certificate": "此证书",
@@ -149,15 +236,20 @@ const zh: StrMap = {
   "link.docs": "在线文档",
   "link.readme": "项目说明",
 
+  /* --- copy feedback --- */
+  "copy.tooltip": "复制{label}",
+  "copy.success": "已将{label}复制到剪贴板。",
+  "copy.failure": "无法将{label}复制到剪贴板。",
+
   /* --- status --- */
-  "status.disabled": "已禁用。您可以在下方「设置」中启用。",
+  "status.disabled": "已禁用。{hint}",
   "status.enabled": "已启用",
 
   /* --- certificate warnings --- */
   "status.expired": "您的证书已过期！",
   "status.expiredDesc":
     "您必须点击下方「重新生成证书」按钮来重新生成证书，才能安全地连接到此 API。",
-  "status.expiringSoon": "您的证书将在 {days} 天后过期！",
+  "status.expiringSoon": "您的证书将在 {days} 天后过期{suffix}！",
   "status.expiringDesc":
     "您应当点击下方「重新生成证书」按钮来重新生成证书，以继续安全地连接到此 API。",
   "status.regenerate": "建议您重新生成证书！",
@@ -204,6 +296,54 @@ const zh: StrMap = {
   "setting.verboseLoggingDesc":
     "启用后，将在浏览器控制台中记录服务器启动消息和每个请求的单行访问日志。",
 
+  /* --- REST section additions --- */
+  "rest.serverStatus": "服务器状态",
+  "rest.secureServerName": "加密（HTTPS）服务器",
+  "rest.insecureServerName": "非加密（HTTP）服务器",
+  "rest.serverUrlCopyLabel": "服务器 URL",
+  "rest.disabledHint": "您可以在下方的设置中启用。",
+  "rest.apiKeyDesc":
+    "通过 {header} 标头以 Bearer 令牌形式传递；详情请参阅下方的「如何访问」页面。",
+  "rest.howToAccessDesc": "连接 URL、身份验证和 API 文档。",
+
+  /* --- MCP section additions --- */
+  "mcp.howToAccessDesc": "MCP 端点、身份验证和客户端配置示例。",
+
+  /* --- certificate display & update --- */
+  "cert.status": "证书状态",
+  "cert.expired": "已过期",
+  "cert.expiresIn": "将在 {days} 天后过期{suffix}",
+  "cert.shouldRegenerate": "建议重新生成",
+  "cert.updateAvailable": "有可用更新",
+  "cert.valid": "有效",
+  "cert.caUpdate":
+    "证书生成已更新，支持某些浏览器和工具（例如 Firefox）最近版本执行的更严格验证。您当前的证书在目前已支持的所有地方仍可正常使用。如果发现浏览器或工具拒绝该证书，请点击下方的「重新生成证书」，然后在之前信任旧证书的地方重新导入新生成的证书。",
+
+  /* --- settings page sections --- */
+  "setting.certificates": "证书",
+  "setting.certificatesDesc": "重新生成证书，编辑证书主机名、密钥材料和 API 密钥。",
+
+  /* --- modal dialogs --- */
+  "modal.resetTitle": "重置所有加密信息？",
+  "modal.resetMessage":
+    "此操作将重新生成您的证书、私钥、公钥和 API 密钥，并关闭此设置面板。此操作不可撤销。",
+  "modal.restoreTitle": "恢复默认设置？",
+  "modal.restoreMessage":
+    "此操作将重置此插件的设置为默认值，并关闭此设置面板。此操作不可撤销。",
+
+  /* --- advanced page --- */
+  "advanced.license": "许可证",
+  "advanced.caCert": "CA 证书",
+  "advanced.caCertDesc":
+    "签署服务器证书的证书颁发机构；客户端会下载并信任此证书。如果您的服务器证书是自签名的，请留空。",
+  "advanced.caPrivateKey": "CA 私钥",
+  "advanced.caPrivateKeyDesc":
+    "用于在证书到期前自动续期服务器证书。留空以禁用自动续期。",
+  "advanced.serverCert": "服务器证书",
+  "advanced.serverCertDesc": "HTTPS 服务器呈现的证书。",
+  "advanced.serverPublicKey": "服务器公钥",
+  "advanced.serverPrivateKey": "服务器私钥",
+
   /* --- advanced static text --- */
   "advanced.warning":
     "以下设置可能存在安全风险，仅供了解其作用的人使用。如果您不了解某项设置的用途及其安全影响，请不要更改它。",
@@ -215,23 +355,26 @@ const zh: StrMap = {
 /*  Language detection & t() function                                  */
 /* ------------------------------------------------------------------ */
 
-function detectLanguage(): string {
-  const lang = navigator.language;
+function detectLanguage(): "en" | "zh" {
+  const lang = getLanguage();
   if (lang.startsWith("zh")) return "zh";
   return "en";
 }
 
-let currentLang: string = detectLanguage();
-const locales: Record<string, StrMap> = { en, zh };
+let currentLang: "en" | "zh" = detectLanguage();
+const locales: Record<"en" | "zh", StrMap> = { en, zh };
 
 /**
  * Translation function that supports placeholder replacement, including HTML content.
  *
  * @param key   The translation key, e.g., "rest.secureNote"
- * @param vars  Optional; an object containing placeholders. Values ​​can be strings or numbers; strings containing HTML tags (e.g., '<a href="...">link</a>') are safely inserted.
+ * @param vars  Optional; an object containing placeholders. Values can be strings or numbers; strings containing HTML tags (e.g., '<a href="...">link</a>') are safely inserted.
  * @returns     The translated string.
  */
-export function t(key: string, vars?: Record<string, string | number>): string {
+export function t(
+  key: MessageKey,
+  vars?: Record<string, string | number>,
+): string {
   const map = locales[currentLang];
   let str = (map && map[key]) ?? locales["en"]?.[key] ?? key;
 
@@ -247,13 +390,11 @@ export function t(key: string, vars?: Record<string, string | number>): string {
  * Override the current language (useful for testing).
  */
 export function setLanguage(lang: string): void {
-  if (locales[lang]) {
-    currentLang = lang;
-  }
+  if (lang === "en" || lang === "zh") currentLang = lang;
 }
 
 /**
- * Force re-detection from navigator.language.
+ * Force re-detection from Obsidian's configured interface language.
  */
 export function resetLanguage(): void {
   currentLang = detectLanguage();
@@ -262,6 +403,6 @@ export function resetLanguage(): void {
 /**
  * Return the currently active language code.
  */
-export function getCurrentLanguage(): string {
+export function getCurrentLanguage(): "en" | "zh" {
   return currentLang;
 }
