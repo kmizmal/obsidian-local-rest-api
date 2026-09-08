@@ -1,9 +1,7 @@
-// eslint-disable-next-line no-restricted-imports -- Moment type is not re-exported by 'obsidian'; import type causes no runtime bundling
-import type { Moment } from "moment";
 import { FileStats, TFile } from "obsidian";
-import { IPeriodicNoteSettings } from "obsidian-daily-notes-interface";
 
 export enum ErrorCode {
+  InvalidFrontmatter = 40005,
   TextContentEncodingRequired = 40010,
   ContentTypeSpecificationRequired = 40011,
   InvalidContentType = 40012,
@@ -11,6 +9,7 @@ export enum ErrorCode {
   MissingDestinationHeader = 40020,
   PathTraversalNotAllowed = 40021,
   InvalidDestinationHeader = 40022,
+  InvalidWithinHeader = 40023,
   MissingTargetTypeHeader = 40053,
   InvalidTargetTypeHeader = 40054,
   MissingTargetHeader = 40055,
@@ -18,13 +17,14 @@ export enum ErrorCode {
   MissingOperation = 40056,
   InvalidOperation = 40057,
   InvalidTargetHeader = 40058,
-  PeriodIsNotEnabled = 40060,
+  InvalidPatchVersionHeader = 40082,
+  HeaderTargetingRequiresVersion1 = 40083,
+  PatchHeaderTargetingRequiresExplicitVersion = 40084,
   InvalidFilterQuery = 40070,
   PatchFailed = 40080,
+  InvalidPatchInstruction = 40081,
   InvalidSearch = 40090,
   ApiKeyAuthorizationRequired = 40101,
-  PeriodDoesNotExist = 40460,
-  PeriodicNoteDoesNotExist = 40461,
   RequestMethodValidOnlyForFiles = 40510,
   DestinationAlreadyExists = 40920,
   ConflictingTargetSpecification = 42200,
@@ -32,13 +32,27 @@ export enum ErrorCode {
   FileOperationFailed = 50020,
 }
 
+/**
+ * The TLS material the plugin serves.
+ *
+ * `cert`/`privateKey`/`publicKey` are the leaf certificate presented by the
+ * HTTPS server and its keypair. `caCert`/`caPrivateKey` hold the certificate
+ * authority that signed the leaf; they are absent for material generated
+ * before the CA/leaf split (a single self-signed certificate that doubled as
+ * its own authority), which the plugin keeps serving unchanged until the
+ * user regenerates it.
+ */
+export interface CryptoSettings {
+  cert: string;
+  privateKey: string;
+  publicKey: string;
+  caCert?: string;
+  caPrivateKey?: string;
+}
+
 export interface LocalRestApiSettings {
   apiKey?: string;
-  crypto?: {
-    cert: string;
-    privateKey: string;
-    publicKey: string;
-  };
+  crypto?: CryptoSettings;
   port: number;
   insecurePort: number;
   enableInsecureServer: boolean;
@@ -48,14 +62,7 @@ export interface LocalRestApiSettings {
   bindingHost?: string;
   subjectAltNames?: string;
   enableVerboseLogging?: boolean;
-}
 
-export interface PeriodicNoteInterface {
-  settings: IPeriodicNoteSettings;
-  loaded: boolean;
-  create: (date: Moment) => Promise<TFile>;
-  get: (date: Moment, all: Record<string, TFile>) => TFile;
-  getAll: () => Record<string, TFile>;
 }
 
 declare module "obsidian" {
@@ -88,8 +95,10 @@ declare module "obsidian" {
       plugins: {
         [key: string]: PluginManifest;
       };
+      getPlugin(id: string): { settings?: Record<string, unknown> } | null;
     };
     internalPlugins: {
+      getPluginById(id: string): { instance?: { options?: Record<string, unknown> } } | null;
       plugins: {
         [key: string]: {
           instance: {
@@ -157,6 +166,7 @@ export interface FileMetadataObject {
   content: string;
   links: string[];
   backlinks: string[];
+  unresolvedLinks: string[];
 }
 
 export interface DocumentMapObject {

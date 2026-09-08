@@ -1,3 +1,4 @@
+local Copy = import 'lib/copy.jsonnet';
 local Delete = import 'lib/delete.jsonnet';
 local Get = import 'lib/get.jsonnet';
 local Move = import 'lib/move.jsonnet';
@@ -5,18 +6,14 @@ local Patch = import 'lib/patch.jsonnet';
 local Post = import 'lib/post.jsonnet';
 local Put = import 'lib/put.jsonnet';
 
-local ParamDay = import 'lib/day.param.jsonnet';
-local ParamMonth = import 'lib/month.param.jsonnet';
 local ParamPath = import 'lib/path.param.jsonnet';
-local ParamPeriod = import 'lib/period.param.jsonnet';
-local ParamYear = import 'lib/year.param.jsonnet';
 
 local TargetingShared = importstr 'lib/descriptions/targeting.md';
 local GetShared = TargetingShared + '\n' + importstr 'lib/descriptions/get-shared.md';
 local PostShared = TargetingShared + '\n' + importstr 'lib/descriptions/post-shared.md';
 local PutShared = TargetingShared + '\n' + importstr 'lib/descriptions/put-shared.md';
 local PatchDescription(fileRef) =
-  'Inserts content into ' + fileRef + ' relative to a heading, block reference, or frontmatter field within that document.\n\n' + Patch.description;
+  'Modifies ' + fileRef + ' with a single structured instruction: an operation applied to a scope of a target — a heading, block reference, or frontmatter field within that document.\n\n' + Patch.description;
 
 local ContentLocationHeader = {
   'Content-Location': {
@@ -37,6 +34,14 @@ std.manifestYamlDoc(
       description: importstr 'lib/descriptions/info.md',
       version: '1.0',
     },
+    // Standalone documentation pages, rendered as sidebar articles by our
+    // customized Stoplight Elements bundle (Bump.sh's x-topics convention).
+    'x-topics': [
+      {
+        title: 'Migrating from 1.x to 2.x',
+        content: importstr 'lib/descriptions/migration-2.0.md',
+      },
+    ],
     servers: [
       {
         url: 'https://{host}:{port}',
@@ -86,6 +91,7 @@ std.manifestYamlDoc(
             'content',
             'links',
             'backlinks',
+            'unresolvedLinks',
           ],
           properties: {
             tags: {
@@ -136,6 +142,13 @@ std.manifestYamlDoc(
                 type: 'string',
               },
             },
+            unresolvedLinks: {
+              type: 'array',
+              description: 'Link text found in this file that does not resolve to an existing vault file.',
+              items: {
+                type: 'string',
+              },
+            },
           },
         },
         Error: {
@@ -153,6 +166,42 @@ std.manifestYamlDoc(
             },
           },
         },
+        HeadingAddress: {
+          description: |||
+            A heading address: the path of heading texts from the top level down
+            to the target. Use `null` or `[]` for the document root.
+          |||,
+          oneOf: [
+            { type: 'array', items: { type: 'string' } },
+            { type: 'null' },
+          ],
+        },
+        HeadingTree: {
+          type: 'object',
+          description: |||
+            The document's headings nested by containment: each heading's text
+            maps to a HeadingTree of its child headings, and a leaf heading maps
+            to `{}`. Nesting carries no heading level — a level skipped in the
+            source leaves no hole. To target a heading, use the path of keys from
+            the top level down to it as a HeadingAddress.
+
+            A repeated sibling heading appears once, but its children are not
+            lost: they merge into that one key, because a heading is addressed by
+            its whole path rather than its name. Given `## Log / ### Monday`
+            followed by `## Log / ### Tuesday`, the tree is
+            `{"Log": {"Monday": {}, "Tuesday": {}}}` and both are separately
+            addressable. Only sections that share an entire path are one address,
+            and that address resolves to the first in document order. The tree
+            therefore lists exactly the headings you can target.
+          |||,
+          additionalProperties: { '$ref': '#/components/schemas/HeadingTree' },
+          example: { Overview: { Details: {} }, Appendix: {} },
+        },
+        // Generated from markdown-patch-2's published Zod schema by
+        // scripts/gen-patch-schema.mjs (run via `npm run build-docs`), so the
+        // REST docs, the MCP tool input, and the engine's validation are one
+        // definition. Edit the Zod schema, not this component.
+        PatchInstruction: import 'lib/patchInstruction.schema.json',
       },
     },
     security: [
@@ -163,7 +212,6 @@ std.manifestYamlDoc(
     tags: [
       { name: 'Vault Files' },
       { name: 'Active File' },
-      { name: 'Periodic Notes' },
       { name: 'Vault Directories' },
       { name: 'Search' },
       { name: 'Commands' },
@@ -220,7 +268,7 @@ std.manifestYamlDoc(
             'Vault Files',
           ],
           summary: 'Create a new file in your vault or update the content of an existing one.\n',
-          description: 'Creates a new file in your vault or updates the content of an existing one if the specified file already exists.\n\n' + PutShared,
+          description: 'Creates a new file in your vault or updates the content of an existing one if the specified file already exists.\n\nAny content type is accepted: a request body that is not text or JSON is stored as raw bytes, so attachments -- images, PDFs, audio -- can be uploaded here as well as notes. There is no size limit beyond the request-size cap.\n\n' + PutShared,
           parameters: [ParamPath] + super.parameters,
         },
         post: Post {
@@ -242,6 +290,9 @@ std.manifestYamlDoc(
         additionalOperations: {
           move: Move {
             parameters: Move.parameters + [ParamPath],
+          },
+          copy: Copy {
+            parameters: Copy.parameters + [ParamPath],
           },
         },
         delete: Delete {
@@ -351,89 +402,6 @@ std.manifestYamlDoc(
               },
             },
           },
-        },
-      },
-      '/periodic/{period}/': {
-        get: Get + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Get current periodic note for the specified period.\n',
-          description: (importstr 'lib/descriptions/periodic-current-get.md') + '\n' + GetShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        put: Put + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Update the content of the current periodic note for the specified period.\n',
-          description: PutShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        post: Post + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Append content to the current periodic note for the specified period.\n',
-          description: (importstr 'lib/descriptions/periodic-current-post.md') + '\n' + PostShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        patch: Patch + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Partially update content in the current periodic note for the specified period.\n',
-          description: PatchDescription('the current periodic note for the specified period'),
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        delete: Delete + WithContentLocation(['204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Delete the current periodic note for the specified period.\n',
-          parameters+: [ParamPeriod],
-        },
-      },
-      '/periodic/{period}/{year}/{month}/{day}/': {
-        get: Get + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Get the periodic note for the specified period and date.\n',
-          description: (importstr 'lib/descriptions/periodic-date-get.md') + '\n' + GetShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        put: Put + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Update the content of the periodic note for the specified period and date.\n',
-          description: PutShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        post: Post + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Append content to the periodic note for the specified period and date.\n',
-          description: (importstr 'lib/descriptions/periodic-date-post.md') + '\n' + PostShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        patch: Patch + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Partially update content in the periodic note for the specified period and date.\n',
-          description: PatchDescription('a periodic note for the specified period and date'),
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        delete: Delete + WithContentLocation(['204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Delete the periodic note for the specified period and date.\n',
-          description: 'Deletes the periodic note for the specified period.\n',
-          parameters+: [ParamYear, ParamMonth, ParamDay, ParamPeriod],
         },
       },
       '/tags/': {
@@ -838,8 +806,8 @@ std.manifestYamlDoc(
       '/mcp/': {
         get: {
           tags: ['MCP'],
-          summary: 'Open a server-sent events stream for an existing MCP session.\n',
-          description: 'Opens a long-lived SSE stream so the server can push messages to the client for an existing session. Requires the session ID returned by the `initialize` response.\n',
+          summary: 'Open a server-sent events stream for an existing sessionful MCP session.\n',
+          description: 'Opens a long-lived SSE stream so the server can push messages to the client for an existing session. Requires the session ID returned by the `initialize` response. This is a session operation of the sessionful protocol revisions (`2024-10-07` through `2025-11-25`); the `2026-07-28` revision removed it, and clients on that revision open a `subscriptions/listen` stream over POST instead.\n',
           parameters: [
             {
               name: 'Mcp-Session-Id',
@@ -853,7 +821,7 @@ std.manifestYamlDoc(
             {
               name: 'MCP-Protocol-Version',
               'in': 'header',
-              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Required on all requests after initialization. Unrecognised values are rejected with 400.',
+              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Unrecognised values are rejected with 400.',
               required: false,
               schema: {
                 type: 'string',
@@ -911,7 +879,7 @@ std.manifestYamlDoc(
             {
               name: 'Mcp-Session-Id',
               'in': 'header',
-              description: 'Session ID returned by the server on initialization. Omit for the initial `initialize` request; required for all subsequent requests.',
+              description: 'Session ID returned by the server on initialization. A session operation of the sessionful protocol revisions (`2024-10-07` through `2025-11-25`): omit it for the initial `initialize` request, send it on every later request of that session, and expect 404 if the session has ended. The `2026-07-28` revision has no sessions — the header is neither issued nor read there.',
               required: false,
               schema: {
                 type: 'string',
@@ -920,7 +888,25 @@ std.manifestYamlDoc(
             {
               name: 'MCP-Protocol-Version',
               'in': 'header',
-              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Required on all requests after initialization. Unrecognised values are rejected with 400.',
+              description: 'Protocol revision this request speaks. Required on every request on the `2026-07-28` revision, where it must match `params._meta["io.modelcontextprotocol/protocolVersion"]`; on the sessionful revisions it carries the version negotiated during `initialize` (e.g. `2025-06-18`). Unrecognised values are rejected with 400.',
+              required: false,
+              schema: {
+                type: 'string',
+              },
+            },
+            {
+              name: 'Mcp-Method',
+              'in': 'header',
+              description: 'The JSON-RPC method named in the request body. Required on `2026-07-28` requests; a value that disagrees with the body is rejected with 400 and JSON-RPC error `-32020`.',
+              required: false,
+              schema: {
+                type: 'string',
+              },
+            },
+            {
+              name: 'Mcp-Name',
+              'in': 'header',
+              description: 'The primary subject named in the request body — `params.name` for `tools/call` and `prompts/get`, `params.uri` for `resources/read`. Required on `2026-07-28` requests that carry one; a value that disagrees with the body is rejected with 400 and JSON-RPC error `-32020`.',
               required: false,
               schema: {
                 type: 'string',
@@ -949,6 +935,7 @@ std.manifestYamlDoc(
                       type: 'string',
                       description: 'MCP method to invoke.',
                       enum: [
+                        'server/discover',
                         'initialize',
                         'tools/list',
                         'tools/call',
@@ -966,13 +953,34 @@ std.manifestYamlDoc(
                   },
                 },
                 examples: {
-                  list_tools: {
-                    summary: 'List all available MCP tools',
+                  discover: {
+                    summary: 'Discover the supported protocol revisions and capabilities (2026-07-28)',
                     value: {
                       jsonrpc: '2.0',
                       id: 1,
+                      method: 'server/discover',
+                      params: {
+                        _meta: {
+                          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                          'io.modelcontextprotocol/clientInfo': { name: 'my-client', version: '1.0.0' },
+                          'io.modelcontextprotocol/clientCapabilities': {},
+                        },
+                      },
+                    },
+                  },
+                  list_tools: {
+                    summary: 'List all available MCP tools (2026-07-28)',
+                    value: {
+                      jsonrpc: '2.0',
+                      id: 2,
                       method: 'tools/list',
-                      params: {},
+                      params: {
+                        _meta: {
+                          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                          'io.modelcontextprotocol/clientInfo': { name: 'my-client', version: '1.0.0' },
+                          'io.modelcontextprotocol/clientCapabilities': {},
+                        },
+                      },
                     },
                   },
                   call_vault_read: {
@@ -1000,7 +1008,7 @@ std.manifestYamlDoc(
                         arguments: {
                           path: 'path/to/note.md',
                           targetType: 'heading',
-                          target: 'My Section',
+                          target: ['My Section'],
                           operation: 'append',
                           content: 'New line of content\n',
                         },
@@ -1024,10 +1032,10 @@ std.manifestYamlDoc(
           },
           responses: {
             '200': {
-              description: 'Message handled. Response body contains the JSON-RPC result, or may be empty for notifications. On session initialization the `Mcp-Session-Id` response header contains the new session ID.',
+              description: 'Message handled. The body is either a single JSON-RPC response (`application/json`) or a server-sent event stream carrying request-scoped notifications followed by the response (`text/event-stream`); notifications are answered with `202 Accepted` and no body. On a sessionful-revision `initialize` the `Mcp-Session-Id` response header carries the new session ID; `2026-07-28` requests are served without one.',
               headers: {
                 'Mcp-Session-Id': {
-                  description: 'Session ID assigned by the server. Present only on the `initialize` response.',
+                  description: 'Session ID assigned by the server. Present only on a sessionful-revision `initialize` response.',
                   schema: {
                     type: 'string',
                   },
@@ -1035,17 +1043,7 @@ std.manifestYamlDoc(
               },
             },
             '400': {
-              description: 'Unsupported MCP-Protocol-Version.',
-              content: {
-                'application/json': {
-                  schema: {
-                    '$ref': '#/components/schemas/Error',
-                  },
-                },
-              },
-            },
-            '404': {
-              description: 'Session not found.',
+              description: 'Unsupported `MCP-Protocol-Version`, or — on the `2026-07-28` revision — a JSON-RPC error response carrying `-32020` (headers disagree with the body), `-32022` (unsupported protocol version), or `-32602` (malformed `_meta` envelope).',
               content: {
                 'application/json': {
                   schema: {
@@ -1064,6 +1062,16 @@ std.manifestYamlDoc(
                 },
               },
             },
+            '404': {
+              description: 'Session not found. The `Mcp-Session-Id` header names a session that has ended; hand-shake again with `initialize`.',
+              content: {
+                'application/json': {
+                  schema: {
+                    '$ref': '#/components/schemas/Error',
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -1072,7 +1080,14 @@ std.manifestYamlDoc(
           tags: [
             'System',
           ],
-          summary: 'Returns the certificate in use by this API.\n',
+          summary: 'Returns the certificate to trust in order to connect to this API.\n',
+          description: |||
+            Returns, in PEM format, the certificate authority that signed the certificate the HTTPS server presents; import this as a trusted authority in your OS, browser, or HTTP client to connect without certificate warnings.
+
+            The authority carries a critical `nameConstraints` extension permitting only `127.0.0.1`, `localhost`, the configured binding host, and the configured subject alternative names, so trusting it grants it no authority over other hostnames.
+
+            Installations still running certificate material generated before the plugin began issuing a separate certificate authority return their single self-signed certificate instead. The authenticated `GET /` response's `certificateInfo.regenerateReason` reports `ca-used-as-leaf` in that case.
+          |||,
           responses: {
             '200': {
               description: 'Success',

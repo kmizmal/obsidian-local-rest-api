@@ -3,10 +3,11 @@ import {
   App,
   CachedMetadata,
   Command,
+  Component,
+  MarkdownRenderer,
   prepareSimpleSearch,
   TFile,
 } from "obsidian";
-import * as periodicNotes from "obsidian-daily-notes-interface";
 import path from "path";
 import {
   applyPatch,
@@ -15,13 +16,21 @@ import {
   PatchOperation,
   PatchTargetType,
 } from "markdown-patch";
- 
-const jsonLogic = require("json-logic-js") as {
-  apply: (logic: unknown, data?: unknown) => unknown;
-  add_operation: (name: string, code: (...args: unknown[]) => unknown) => void;
-};
- 
-const WildcardRegexp = require("glob-to-regexp") as (pattern: string) => RegExp;
+import {
+  patch as patchV2,
+  projectMap,
+  buildModel,
+  readTarget,
+} from "markdown-patch-2";
+import type {
+  InstructionInput,
+  PatchResult,
+  PublicMap,
+  ReadTarget,
+  ReadResult,
+} from "markdown-patch-2";
+import jsonLogic from "json-logic-js";
+import WildcardRegexp from "glob-to-regexp";
 
 export class FileNotFoundError extends Error {}
 export class CommandNotFoundError extends Error {}
@@ -29,17 +38,87 @@ export class DestinationAlreadyExistsError extends Error {}
 
 import {
   DocumentMapObject,
-  ErrorCode,
   FileMetadataObject,
-  PeriodicNoteInterface,
+  LocalRestApiSettings,
   SearchContext,
   SearchJsonResponseItem,
   SearchResponseItem,
 } from "./types";
 import { toArrayBuffer } from "./utils";
 
+/**
+ * Every event Obsidian's metadata cache publicly declares, and every event its
+ * vault publicly declares.
+ *
+ * Deliberately the whole surface rather than the subset that looks like it moves
+ * the link graph. `resolvedLinks` is Obsidian's own derived state, and which of
+ * its events happen to precede an update to it is an implementation detail of a
+ * dependency -- betting a cache's correctness on having read that detail right
+ * is a bet nobody can win permanently. Subscribing to everything removes the
+ * judgement call, and costs only a rebuild the uncached code performed on every
+ * single read anyway.
+ *
+ * `src/vaultOperations.test.ts` reads these names back out of the installed
+ * obsidian typings and fails if the two ever disagree, so an Obsidian upgrade
+ * that adds an event is a red test rather than a cache that quietly goes stale.
+ */
+export const METADATA_CACHE_EVENTS = [
+  "changed",
+  "deleted",
+  "resolve",
+  "resolved",
+] as const;
+export const VAULT_EVENTS = ["create", "modify", "delete", "rename"] as const;
+
+/**
+ * How long a built backlinks index may be served before it is rebuilt anyway.
+ *
+ * The listeners above cover everything Obsidian announces, but "everything it
+ * announces" is not the same as "everything that happens": an event added in a
+ * future release, or an internal path that rewrites `resolvedLinks` without
+ * saying so, would otherwise leave a stale index in place for as long as the
+ * plugin runs. Ageing the index out turns that unbounded failure into a bounded
+ * one, without depending on any part of Obsidian's API being what we think.
+ */
+export const BACKLINKS_INDEX_MAX_AGE_MS = 60_000;
+
+/**
+ * Writes go through Vault.modify/Vault.create rather than Vault.adapter.write.
+ *
+ * The adapter writes straight to disk, behind Obsidian's back: the change is only
+ * noticed later, by the file watcher. Until it is, metadataCache still describes the
+ * previous revision, and because getFileMetadataObject serves frontmatter and tags
+ * from that cache, a client that wrote and immediately read back could be handed
+ * pre-write metadata. Going through the Vault API keeps Obsidian's own bookkeeping in
+ * step with the write instead of racing it.
+ */
 export class VaultOperations {
-  constructor(readonly app: App) {
+  private cachedBacklinksIndex: Record<string, string[]> | null = null;
+  private cachedBacklinksIndexBuiltAt = 0;
+
+  /**
+   * Called whenever Obsidian says anything at all has happened.
+   *
+   * Deliberately one handler for every announcement rather than a targeted
+   * update per event: rebuilding is the same work the uncached code did on
+   * every request, so an invalidation too many costs a scan we were paying for
+   * anyway, while one too few serves a client stale backlinks.
+   */
+  private readonly invalidateBacklinksIndex = (): void => {
+    this.cachedBacklinksIndex = null;
+  };
+
+  constructor(readonly app: App, readonly settings: LocalRestApiSettings) {
+    for (const event of METADATA_CACHE_EVENTS) {
+      this.app.metadataCache.on(
+        event as "resolved",
+        this.invalidateBacklinksIndex,
+      );
+    }
+    for (const event of VAULT_EVENTS) {
+      this.app.vault.on(event as "modify", this.invalidateBacklinksIndex);
+    }
+
     jsonLogic.add_operation(
       "glob",
       (pattern: string | undefined, field: string | undefined) => {
@@ -58,6 +137,22 @@ export class VaultOperations {
         return false;
       },
     );
+  }
+
+  /**
+   * Releases the link-graph listeners registered in the constructor.
+   *
+   * This object lives as long as the plugin does, so this matters only at
+   * unload -- but a listener left behind holds the whole instance alive and
+   * goes on invalidating a cache nobody will read again.
+   */
+  dispose(): void {
+    for (const event of METADATA_CACHE_EVENTS) {
+      this.app.metadataCache.off(event, this.invalidateBacklinksIndex);
+    }
+    for (const event of VAULT_EVENTS) {
+      this.app.vault.off(event, this.invalidateBacklinksIndex);
+    }
   }
 
   private waitForFileCache(
@@ -119,6 +214,39 @@ export class VaultOperations {
     };
   }
 
+  /**
+   * The markdown-patch 2.0 document map: headings nested by containment (each
+   * heading text maps to its child headings; every occurrence of a repeated
+   * sibling gets its own key, later ones carrying a reserved marker suffix),
+   * block ids disambiguated the same way, frontmatter field names, and the
+   * content-hash `version` token clients pass back as a patch `ifMatch`
+   * precondition.
+   */
+  async getDocumentMapV2Object(file: TFile): Promise<PublicMap> {
+    const content = await this.app.vault.adapter.read(file.path);
+    return projectMap(buildModel(content));
+  }
+
+  /**
+   * The markdown-patch 2.0 targeted read: resolve a `(targetType, target)`
+   * address — a heading path array, a bare block id, or a frontmatter key — and
+   * return the section body (headings/blocks) or parsed value (frontmatter).
+   * Throws {@link TargetNotFoundError} when the address does not resolve.
+   *
+   * `content` lets a caller that has already read the file supply what it read,
+   * rather than paying for a second read — MCP's `vault_read` decodes the raw
+   * bytes itself so it can refuse a file that is not valid UTF-8, and passes the
+   * result through here.
+   */
+  async readFileSectionMdp2(
+    file: TFile,
+    target: ReadTarget,
+    content?: string,
+  ): Promise<ReadResult> {
+    const text = content ?? (await this.app.vault.adapter.read(file.path));
+    return readTarget(text, target);
+  }
+
   async readFileSection(
     file: TFile,
     targetType: string,
@@ -150,6 +278,31 @@ export class VaultOperations {
     return content.substring(entry.content.start, entry.content.end);
   }
 
+  /**
+   * The vault-wide "who links here" index, built at most once per link-graph
+   * change and, failing that, at most once per BACKLINKS_INDEX_MAX_AGE_MS.
+   *
+   * The age check is the half that does not trust Obsidian: the listeners drop
+   * the index the moment anything is announced, and the ceiling makes sure an
+   * announcement that never comes cannot keep a wrong answer in circulation.
+   *
+   * Callers doing bulk work should build one snapshot with this and thread it
+   * through their loop (see `getFileMetadataObject`'s second argument), so that
+   * every row of a result set describes the same moment even if the graph moves
+   * mid-loop.
+   */
+  getBacklinksIndex(): Record<string, string[]> {
+    const now = Date.now();
+    if (
+      this.cachedBacklinksIndex === null ||
+      now - this.cachedBacklinksIndexBuiltAt >= BACKLINKS_INDEX_MAX_AGE_MS
+    ) {
+      this.cachedBacklinksIndex = this.buildBacklinksIndex();
+      this.cachedBacklinksIndexBuiltAt = now;
+    }
+    return this.cachedBacklinksIndex;
+  }
+
   buildBacklinksIndex(): Record<string, string[]> {
     const index: Record<string, string[]> = {};
     for (const [sourcePath, targets] of Object.entries(
@@ -162,10 +315,16 @@ export class VaultOperations {
     return index;
   }
 
+  /**
+   * `content`, like {@link readFileSectionMdp2}'s, is content the caller has
+   * already read: supplying it skips the `cachedRead` below. Ignored when
+   * `includeContent` is false, since then nothing is read at all.
+   */
   async getFileMetadataObject(
     file: TFile,
     backlinksIndex?: Record<string, string[]>,
     includeContent = true,
+    content?: string,
   ): Promise<FileMetadataObject> {
     const cache = await this.waitForFileCache(file);
 
@@ -186,45 +345,88 @@ export class VaultOperations {
     const links = Object.keys(
       this.app.metadataCache.resolvedLinks[file.path] ?? {},
     );
+    const unresolvedLinks = Object.keys(
+      this.app.metadataCache.unresolvedLinks[file.path] ?? {},
+    );
 
-    const index = backlinksIndex ?? this.buildBacklinksIndex();
-    const backlinks = index[file.path] ?? [];
+    const index = backlinksIndex ?? this.getBacklinksIndex();
+    // Copied rather than handed out: the cached index outlives the response
+    // built from it, so one caller mutating what it was given would otherwise
+    // reach every caller after it.
+    const backlinks = [...(index[file.path] ?? [])];
 
     return {
       tags: filteredTags,
       frontmatter: frontmatter,
       stat: file.stat,
       path: file.path,
-      content: includeContent ? await this.app.vault.cachedRead(file) : "",
+      content: includeContent
+        ? (content ?? (await this.app.vault.cachedRead(file)))
+        : "",
       links,
       backlinks,
+      unresolvedLinks,
     };
   }
 
-  async resolvePathAndTarget(rawPath: string): Promise<{
+  async renderFileToHtml(file: TFile, content?: string): Promise<string> {
+    const markdown = content ?? (await this.app.vault.cachedRead(file));
+    const el = activeDocument.createElement("div");
+    const component = new Component();
+    component.load();
+    try {
+      await MarkdownRenderer.render(this.app, markdown, el, file.path, component);
+      return el.innerHTML;
+    } finally {
+      component.unload();
+    }
+  }
+
+  async resolvePathAndTarget(rawSegments: string[]): Promise<{
     filePath: string;
     targetType?: string;
     target?: string;
+    // For a heading target, the raw path segments as an array (e.g. ["A", "B"]
+    // for `.../heading/A/B`). Preserved alongside the `::`-joined `target` so the
+    // 2.0 engine can address headings array-natively without a delimiter split
+    // that a heading containing `::` would break.
+    targetSegments?: string[];
   } | null> {
-    const normalizedPath = rawPath.endsWith("/")
-      ? rawPath.slice(0, -1)
-      : rawPath;
-    if (!normalizedPath) return null;
+    // Segments arrive already split on the URL's *raw* slashes and decoded one
+    // by one, so a `%2F` inside a segment is a literal `/` belonging to that
+    // segment (a heading name), not a path boundary. Drop a trailing empty
+    // segment left by a trailing slash.
+    const segments =
+      rawSegments.length > 0 && rawSegments[rawSegments.length - 1] === ""
+        ? rawSegments.slice(0, -1)
+        : rawSegments;
+    if (segments.length === 0) return null;
 
-    let exactStat = null;
-    try {
-      exactStat = await this.app.vault.adapter.stat(normalizedPath);
-    } catch {
-      // ENOTDIR: a path component is a file, not a directory;
-      // fall through to the backward walk which will find the actual file.
-    }
-    if (exactStat?.type === "file") {
-      return { filePath: normalizedPath };
+    // A file or folder name cannot contain `/`, so a candidate file path is only
+    // valid when none of its segments do. This is what keeps a decoded `%2F`
+    // from re-forming a path separator: `folder%2Fnote.md` is a single segment
+    // "folder/note.md", which can never be a file component and so never
+    // resolves as one.
+    const isFilePath = (parts: string[]): boolean =>
+      parts.every((part) => !part.includes("/"));
+
+    if (isFilePath(segments)) {
+      let exactStat = null;
+      try {
+        exactStat = await this.app.vault.adapter.stat(segments.join("/"));
+      } catch {
+        // ENOTDIR: a path component is a file, not a directory;
+        // fall through to the backward walk which will find the actual file.
+      }
+      if (exactStat?.type === "file") {
+        return { filePath: segments.join("/") };
+      }
     }
 
-    const segments = normalizedPath.split("/");
     for (let i = segments.length - 1; i >= 1; i--) {
-      const candidate = segments.slice(0, i).join("/");
+      const prefix = segments.slice(0, i);
+      if (!isFilePath(prefix)) continue;
+      const candidate = prefix.join("/");
       let s = null;
       try {
         s = await this.app.vault.adapter.stat(candidate);
@@ -234,11 +436,13 @@ export class VaultOperations {
       if (s?.type === "file") {
         const remainder = segments.slice(i);
         const targetType = remainder[0];
+        const targetSegments =
+          targetType === "heading" ? remainder.slice(1) : undefined;
         const target =
           targetType === "heading"
             ? remainder.slice(1).join("::")
             : remainder[1];
-        return { filePath: candidate, targetType, target };
+        return { filePath: candidate, targetType, target, targetSegments };
       }
     }
 
@@ -277,6 +481,18 @@ export class VaultOperations {
     return this.app.vault.read(file);
   }
 
+  // Reads a file as raw bytes rather than decoding it as UTF-8, which is what
+  // `readFileContent` above (and `cachedRead` behind `getFileMetadataObject`) does. The
+  // REST layer reaches for `adapter.readBinary` directly; MCP goes through here so the
+  // "does this file exist" answer is the same one `vault_read` gives.
+  async readBinaryFileContent(filePath: string): Promise<ArrayBuffer> {
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (!(file instanceof TFile)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    return this.app.vault.adapter.readBinary(filePath);
+  }
+
   async writeFileContent(
     filePath: string,
     content: string | Buffer,
@@ -287,7 +503,12 @@ export class VaultOperations {
       // folder already exists
     }
     if (typeof content === "string") {
-      await this.app.vault.adapter.write(filePath, content);
+      const existing = this.app.vault.getAbstractFileByPath(filePath);
+      if (existing instanceof TFile) {
+        await this.app.vault.modify(existing, content);
+      } else {
+        await this.app.vault.create(filePath, content);
+      }
     } else {
       await this.app.vault.adapter.writeBinary(
         filePath,
@@ -309,17 +530,28 @@ export class VaultOperations {
       if (!fileContents.endsWith("\n")) {
         fileContents += "\n";
       }
+      fileContents += content;
+      await this.app.vault.modify(file, fileContents);
+      return;
     }
-    fileContents += content;
-    await this.app.vault.adapter.write(filePath, fileContents);
+    await this.app.vault.create(filePath, content);
   }
 
-  async deleteVaultFile(filePath: string): Promise<void> {
-    const pathExists = await this.app.vault.adapter.exists(filePath);
-    if (!pathExists) {
+  async deleteVaultFile(filePath: string, permanent = false): Promise<void> {
+    if (permanent) {
+      const pathExists = await this.app.vault.adapter.exists(filePath);
+      if (!pathExists) {
+        throw new FileNotFoundError(`File not found: ${filePath}`);
+      }
+      await this.app.vault.adapter.remove(filePath);
+      return;
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (!file) {
       throw new FileNotFoundError(`File not found: ${filePath}`);
     }
-    await this.app.vault.adapter.remove(filePath);
+    await this.app.fileManager.trashFile(file);
   }
 
   async moveVaultFile(
@@ -363,6 +595,48 @@ export class VaultOperations {
     return sourceFile.path;
   }
 
+  async copyVaultFile(
+    sourcePath: string,
+    destinationPath: string,
+    allowOverwrite = false,
+  ): Promise<string> {
+    if (!destinationPath) {
+      throw new Error("Destination path must not be empty.");
+    }
+
+    const sourceFile = this.app.vault.getAbstractFileByPath(sourcePath);
+    if (!(sourceFile instanceof TFile)) {
+      throw new FileNotFoundError(`File not found: ${sourcePath}`);
+    }
+
+    if (sourcePath === destinationPath) {
+      throw new DestinationAlreadyExistsError(
+        `Destination already exists: ${destinationPath}`,
+      );
+    }
+
+    const destExists = await this.app.vault.adapter.exists(destinationPath);
+    if (destExists) {
+      if (!allowOverwrite) {
+        throw new DestinationAlreadyExistsError(
+          `Destination already exists: ${destinationPath}`,
+        );
+      }
+      await this.app.vault.adapter.remove(destinationPath);
+    }
+
+    const parentDir = destinationPath.substring(
+      0,
+      destinationPath.lastIndexOf("/"),
+    );
+    if (parentDir && !(await this.app.vault.adapter.exists(parentDir))) {
+      await this.app.vault.createFolder(parentDir);
+    }
+
+    const copiedFile = await this.app.vault.copy(sourceFile, destinationPath);
+    return copiedFile.path;
+  }
+
   // Throws PatchFailed on patch error; caller is responsible for mapping to
   // the appropriate HTTP error code or MCP error.
   async patchFileSection(
@@ -403,101 +677,28 @@ export class VaultOperations {
     } as PatchInstruction;
 
     const patched = applyPatch(fileContents, instruction);
-    await this.app.vault.adapter.write(filePath, patched);
+    await this.app.vault.modify(file, patched);
     return patched;
   }
 
-  getPeriodicNoteInterface(): Record<string, PeriodicNoteInterface> {
-    return {
-      daily: {
-        settings: periodicNotes.getDailyNoteSettings(),
-        loaded: periodicNotes.appHasDailyNotesPluginLoaded(),
-        create: periodicNotes.createDailyNote,
-        get: periodicNotes.getDailyNote,
-        getAll: periodicNotes.getAllDailyNotes,
-      },
-      weekly: {
-        settings: periodicNotes.getWeeklyNoteSettings(),
-        loaded: periodicNotes.appHasWeeklyNotesPluginLoaded(),
-        create: periodicNotes.createWeeklyNote,
-        get: periodicNotes.getWeeklyNote,
-        getAll: periodicNotes.getAllWeeklyNotes,
-      },
-      monthly: {
-        settings: periodicNotes.getMonthlyNoteSettings(),
-        loaded: periodicNotes.appHasMonthlyNotesPluginLoaded(),
-        create: periodicNotes.createMonthlyNote,
-        get: periodicNotes.getMonthlyNote,
-        getAll: periodicNotes.getAllMonthlyNotes,
-      },
-      quarterly: {
-        settings: periodicNotes.getQuarterlyNoteSettings(),
-        loaded: periodicNotes.appHasQuarterlyNotesPluginLoaded(),
-        create: periodicNotes.createQuarterlyNote,
-        get: periodicNotes.getQuarterlyNote,
-        getAll: periodicNotes.getAllQuarterlyNotes,
-      },
-      yearly: {
-        settings: periodicNotes.getYearlyNoteSettings(),
-        loaded: periodicNotes.appHasYearlyNotesPluginLoaded(),
-        create: periodicNotes.createYearlyNote,
-        get: periodicNotes.getYearlyNote,
-        getAll: periodicNotes.getAllYearlyNotes,
-      },
-    };
-  }
-
-  periodicGetInterface(
-    period: string,
-  ): [PeriodicNoteInterface | null, ErrorCode | null] {
-    const periodic = this.getPeriodicNoteInterface();
-    if (!periodic[period]) {
-      return [null, ErrorCode.PeriodDoesNotExist];
+  // Applies a single markdown-patch 2.0 instruction and writes the result.
+  // ("Mdp2" = markdown-patch 2.0, not the removed API version 2.0 PATCH.)
+  // Throws FileNotFoundError when the file is missing; lets the 2.0 engine's
+  // typed errors (TargetNotFoundError, PreconditionFailedError, …) propagate for
+  // the caller to map to HTTP responses. Returns the patched document alongside
+  // any advisory warnings the engine surfaced (e.g. heading-depth overflow).
+  async patchFileSectionMdp2(
+    filePath: string,
+    instruction: InstructionInput,
+  ): Promise<PatchResult> {
+    const file = this.app.vault.getAbstractFileByPath(filePath);
+    if (!(file instanceof TFile)) {
+      throw new FileNotFoundError(`File not found: ${filePath}`);
     }
-    if (!periodic[period].loaded) {
-      return [null, ErrorCode.PeriodIsNotEnabled];
-    }
-    return [periodic[period], null];
-  }
-
-  periodicGetNote(
-    periodName: string,
-    timestamp: number,
-  ): [TFile | null, ErrorCode | null] {
-    const [period, err] = this.periodicGetInterface(periodName);
-    if (err || !period) {
-      return [null, err ?? ErrorCode.PeriodDoesNotExist];
-    }
-    const now = window.moment(timestamp);
-    const all = period.getAll();
-
-    const file = period.get(now, all);
-    if (!file) {
-      return [null, ErrorCode.PeriodicNoteDoesNotExist];
-    }
-    return [file, null];
-  }
-
-  async periodicGetOrCreateNote(
-    periodName: string,
-    timestamp: number,
-  ): Promise<[TFile | null, ErrorCode | null]> {
-    const [gottenFile, err] = this.periodicGetNote(periodName, timestamp);
-    let file = gottenFile;
-    if (err === ErrorCode.PeriodicNoteDoesNotExist) {
-      const [period] = this.periodicGetInterface(periodName);
-      if (!period) {
-        return [null, ErrorCode.PeriodDoesNotExist];
-      }
-      const now = window.moment(Date.now());
-
-      file = await period.create(now);
-      await this.waitForFileCache(file);
-    } else if (err) {
-      return [null, err];
-    }
-
-    return [file, null];
+    const fileContents = await this.app.vault.read(file);
+    const result = patchV2(fileContents, instruction);
+    await this.app.vault.modify(file, result.document);
+    return result;
   }
 
   async simpleSearch(
@@ -534,8 +735,11 @@ export class VaultOperations {
                 source: "content",
               },
               context: cachedContents.slice(
-                Math.max(match[0] - positionOffset - contextLength, 0),
-                match[1] - positionOffset + contextLength,
+                ...this.widenToCodePointBoundaries(
+                  cachedContents,
+                  Math.max(match[0] - positionOffset - contextLength, 0),
+                  match[1] - positionOffset + contextLength,
+                ),
               ),
             });
           }
@@ -557,7 +761,7 @@ export class VaultOperations {
     query: unknown,
   ): Promise<SearchJsonResponseItem[]> {
     const results: SearchJsonResponseItem[] = [];
-    const backlinksIndex = this.buildBacklinksIndex();
+    const backlinksIndex = this.getBacklinksIndex();
     const includeContent = JSON.stringify(query).includes('"content"');
 
     for (const file of this.app.vault.getMarkdownFiles()) {
@@ -583,6 +787,54 @@ export class VaultOperations {
     if (Array.isArray(value)) return value.length > 0;
     if (typeof value === "object") return Object.keys(value).length > 0;
     return Boolean(value);
+  }
+
+  /**
+   * Widen a `[start, end)` UTF-16 code-unit range in `text` so that neither
+   * end falls between the two halves of a surrogate pair. `String.prototype.slice`
+   * works in code units, so a window computed from `contextLength` can bisect a
+   * non-BMP character such as an emoji and hand back an unpaired surrogate
+   * (e.g. `\udd0c`), which cannot be encoded as UTF-8. The range is only ever
+   * grown, by at most one code unit per side: a `start` on a low surrogate
+   * moves back to include its high surrogate, and an `end` just past a high
+   * surrogate moves forward to include its low surrogate. Out-of-range bounds
+   * and boundaries already on a whole code point are returned unchanged.
+   * Lone surrogates already present in `text` are not repaired.
+   *
+   * This is deliberately not `String.prototype.toWellFormed()` (ES2024). That
+   * method operates on an already-sliced string, so the missing half of the
+   * pair is gone by the time it runs and the character cannot be recovered;
+   * it substitutes U+FFFD (`\ufffd`) for each lone surrogate instead, which
+   * would put a visible replacement character into user-facing search context
+   * where the original emoji belongs. Widening the range before slicing keeps
+   * the whole character.
+   *
+   * @param text The string the range indexes into.
+   * @param start Inclusive start offset, in UTF-16 code units.
+   * @param end Exclusive end offset, in UTF-16 code units.
+   * @returns The `[start, end)` pair, widened where necessary, suitable for
+   *   spreading into `text.slice`.
+   */
+  private widenToCodePointBoundaries(
+    text: string,
+    start: number,
+    end: number,
+  ): [number, number] {
+    let widenedStart = start;
+    if (widenedStart > 0 && widenedStart < text.length) {
+      const codeUnit = text.charCodeAt(widenedStart);
+      if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+        widenedStart -= 1;
+      }
+    }
+    let widenedEnd = end;
+    if (widenedEnd > 0 && widenedEnd < text.length) {
+      const codeUnit = text.charCodeAt(widenedEnd - 1);
+      if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+        widenedEnd += 1;
+      }
+    }
+    return [widenedStart, widenedEnd];
   }
 
   getAllTags(): Array<{ name: string; count: number }> {
